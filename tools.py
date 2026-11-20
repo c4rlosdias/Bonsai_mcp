@@ -243,6 +243,8 @@ def get_blender_connection():
 def execute_blender_code(ctx: Context, code: str) -> str:
     """
     Execute arbitrary Python code in Blender.
+    Anything printed with print() is returned, and if the code assigns a variable
+    named `result`, its value is returned as JSON.
     
     Parameters:
     - code: The Python code to execute
@@ -252,7 +254,13 @@ def execute_blender_code(ctx: Context, code: str) -> str:
         blender = get_blender_connection()
         
         result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        text = "Code executed successfully."
+        output = result.get("output") if isinstance(result, dict) else None
+        if output:
+            text += f"\n--- output ---\n{output}"
+        if isinstance(result, dict) and "result" in result:
+            text += f"\n--- result ---\n{json.dumps(result['result'], ensure_ascii=False, indent=2, default=str)}"
+        return text
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
@@ -1047,6 +1055,405 @@ def generate_ids(
     except Exception as e:
         return json.dumps({"ok": False, "error": "Fallo al crear IDS", "details": str(e)},
                           ensure_ascii=False, indent=2)
+
+
+# -------------------------------
+# GEOMETRY ANALYSIS & TEMPORARY DRAWINGS
+# -------------------------------
+
+def _send(command: str, params: dict) -> str:
+    """Send a command to the add-on, dropping None params, and return pretty JSON."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command(command, {k: v for k, v in params.items() if v is not None})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Error in {command}: {str(e)}")
+        return json.dumps({"error": f"Error in {command}: {str(e)}"}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def get_element_geometry(
+    global_ids: Optional[List[str]] = None,
+    entity_type: Optional[str] = None,
+    selected_only: bool = False,
+    limit: int = 100,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Compute the 3D geometry of IFC elements with IfcOpenShell (OpenCASCADE) and return,
+    per element: the world axis-aligned bounding box (min, max, size, center), the oriented
+    bounding box in the element's own placement (true length x width x height for rotated
+    elements, plus placement origin and axes), volume (m3), surface area (m2) and mesh counts.
+    Also returns the combined AABB of all requested elements. Units: metres, world coordinates.
+
+    Choose elements with any combination of:
+      - global_ids: list of GlobalIds (STEP ids like "#123" also work)
+      - entity_type: IFC class, e.g. "IfcBeam" (comma-separated list allowed: "IfcWall,IfcSlab")
+      - selected_only: elements selected in the Blender viewport
+
+    Geometry is cached; set rebuild_cache=True after the model has been edited.
+    """
+    return _send("get_element_geometry", dict(global_ids=global_ids, entity_type=entity_type,
+                                              selected_only=selected_only, limit=limit,
+                                              rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def measure_distance(
+    global_id_a: str,
+    global_id_b: str,
+    tolerance: float = 0.002,
+    draw: bool = False,
+    show_components: bool = False,
+    color: Optional[str] = None,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Measure the minimum (surface-to-surface) distance between two IFC elements using
+    IfcOpenShell's geometry tree (same engine as IfcClash).
+
+    Returns status ("separate", "touching" or "intersecting"), the minimum distance, the closest
+    points on each element, the delta xyz between them, and the gap between bounding boxes.
+    When intersecting, returns clash_type (protrusion/pierce/...) and penetration_depth.
+    tolerance: penetrations smaller than this (m) are ignored when testing intersection.
+
+    draw=True also draws a temporary dimension line in the 3D viewport between the closest
+    points (red if clashing). show_components=True adds the Δx/Δy/Δz legs.
+    """
+    return _send("measure_distance", dict(global_id_a=global_id_a, global_id_b=global_id_b,
+                                          tolerance=tolerance, draw=draw,
+                                          show_components=show_components, color=color,
+                                          rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def detect_clashes(
+    group_a: Optional[List[str]] = None,
+    group_b: Optional[List[str]] = None,
+    mode: str = "intersection",
+    tolerance: float = 0.002,
+    clearance: float = 0.05,
+    allow_touching: bool = False,
+    ignore_related: bool = True,
+    limit: int = 200,
+    draw: bool = False,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Clash detection between two groups of IFC elements, using IfcOpenShell's geometry tree.
+
+    group_a / group_b: lists mixing IFC classes ("IfcBeam") and/or GlobalIds.
+      - group_a empty -> all building elements; group_b empty -> group_a against itself.
+    mode:
+      - "intersection": hard clashes; penetrations deeper than `tolerance` (m).
+        distance = penetration depth. clash_type = protrusion | pierce.
+      - "collision": any contact; allow_touching=True ignores faces that merely touch.
+      - "clearance": soft clashes; elements closer than `clearance` (m) without intersecting.
+        distance = gap between them.
+    ignore_related=True skips expected contacts: host x filling (wall/door via opening),
+    aggregates and nests.
+
+    Returns clashes sorted by severity with the points on each element, plus counts by
+    pair of IFC classes. draw=True marks each clash in the viewport (temporary drawing).
+    """
+    return _send("detect_clashes", dict(group_a=group_a, group_b=group_b, mode=mode,
+                                        tolerance=tolerance, clearance=clearance,
+                                        allow_touching=allow_touching,
+                                        ignore_related=ignore_related, limit=limit, draw=draw,
+                                        rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def draw_dimension(
+    start: List[float],
+    end: List[float],
+    label: Optional[str] = None,
+    color: Optional[str] = None,
+    width: float = 2.5,
+    show_components: bool = False,
+    on_top: bool = True,
+    group: Optional[str] = None,
+) -> str:
+    """
+    Draw a TEMPORARY dimension line in every Blender 3D viewport between two world points
+    [x, y, z] in metres, with end ticks and a label (defaults to the length, e.g. "2.350 m").
+
+    color: orange (default), red, green, blue, yellow, cyan, magenta, white, black,
+           or [r, g, b(, a)] in 0-1 or 0-255.
+    show_components=True also draws the Δx / Δy / Δz legs.
+    on_top=False lets the model hide the line (depth test).
+    group: optional name to clear several drawings together.
+
+    Drawings are viewport overlays only: they are not saved in the .blend or the .ifc.
+    Remove them with clear_temporary_drawings.
+    """
+    return _send("draw_dimension", dict(start=start, end=end, label=label, color=color,
+                                        width=width, show_components=show_components,
+                                        on_top=on_top, group=group))
+
+
+@mcp.tool()
+def draw_bounding_boxes(
+    global_ids: Optional[List[str]] = None,
+    entity_type: Optional[str] = None,
+    selected_only: bool = False,
+    oriented: bool = False,
+    color: Optional[str] = None,
+    show_labels: bool = True,
+    limit: int = 200,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Draw TEMPORARY wireframe bounding boxes around IFC elements in the 3D viewport, labelled
+    with the element name and its size (m).
+
+    oriented=False draws the world axis-aligned box; oriented=True draws the box aligned with
+    the element's own placement (tight fit for rotated elements).
+    Select elements by global_ids, entity_type (e.g. "IfcColumn") and/or selected_only.
+    Remove them with clear_temporary_drawings.
+    """
+    return _send("draw_bounding_boxes", dict(global_ids=global_ids, entity_type=entity_type,
+                                             selected_only=selected_only, oriented=oriented,
+                                             color=color, show_labels=show_labels, limit=limit,
+                                             rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def clear_temporary_drawings(
+    drawing_ids: Optional[List[int]] = None,
+    group: Optional[str] = None,
+    list_only: bool = False,
+) -> str:
+    """
+    Remove temporary viewport drawings (dimensions, bounding boxes, clash markers).
+    With no arguments removes everything; or pass drawing_ids and/or a group name.
+    list_only=True removes nothing and just lists the current drawings.
+    """
+    return _send("clear_temporary_drawings", dict(drawing_ids=drawing_ids, group=group,
+                                                  list_only=list_only))
+
+
+@mcp.tool()
+def get_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    List the space boundaries (IfcRelSpaceBoundary / 1st / 2nd level) of IfcSpaces.
+
+    space_ids: GlobalIds, STEP ids, or space Name / LongName (e.g. "04" or "Sala").
+               Empty -> all spaces.
+
+    For each boundary returns: the related building element (class, name, GlobalId) and its
+    effective PredefinedType (type wins over occurrence unless NOTDEFINED; USERDEFINED resolves
+    to ElementType/ObjectType) with its source, PhysicalOrVirtualBoundary,
+    InternalOrExternalBoundary, position relative to the space (floor / ceiling / wall /
+    inclined, from the surface normal), area (m2), normal and centroid in world coordinates,
+    and Parent/Corresponding/Inner boundaries for 2nd-level boundaries.
+    Per space it also summarises counts by element class, area by position, and the floor
+    area of the space's own geometry for comparison.
+    """
+    return _send("get_space_boundaries", dict(space_ids=space_ids, rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def validate_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    proximity: float = 0.03,
+    area_tolerance: float = 0.05,
+    candidate_classes: Optional[List[str]] = None,
+    min_contact: float = 0.10,
+    limit: int = 300,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Validate IfcRelSpaceBoundary of spaces and compare them with the real geometry.
+
+    Semantic checks: spaces without boundaries (E01), missing ConnectionGeometry (E02),
+    PHYSICAL without element (E03), VIRTUAL with a physical element (W04),
+    Physical/Virtual or Internal/External NOTDEFINED (W05/W06), zero area (W07),
+    duplicates (W08), door/window without a boundary of its host wall (W09), covering
+    PredefinedType inconsistent with the boundary position (W10: floor->FLOORING,
+    ceiling->CEILING, wall->CLADDING...), missing floor/ceiling/wall (W14),
+    non-reciprocal CorrespondingBoundary (W15), opening without ParentBoundary (W16).
+
+    Geometric checks (IfcOpenShell geometry tree):
+      - I12: element of candidate_classes touching the space (gap <= proximity m, contact patch
+        >= min_contact m) without a boundary -> possibly missing boundary.
+      - W11: declared boundary element that does not touch the space.
+        I17 when it sits behind a covering that touches the space (expected situation).
+      - W13: sum of floor/ceiling boundary areas differs from the space geometry by more than
+        area_tolerance (fraction).
+    candidate_classes defaults to walls, slabs, roofs, coverings, doors, windows, columns,
+    beams, curtain walls, plates, members, stairs and ramps.
+    """
+    return _send("validate_space_boundaries", dict(space_ids=space_ids, proximity=proximity,
+                                                   area_tolerance=area_tolerance,
+                                                   candidate_classes=candidate_classes,
+                                                   min_contact=min_contact, limit=limit,
+                                                   rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def draw_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    color_by: str = "position",
+    fill: bool = True,
+    opacity: float = 0.35,
+    show_labels: bool = False,
+    element_ids: Optional[List[str]] = None,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Draw the boundary surfaces of spaces as TEMPORARY translucent polygons with outlines in
+    the 3D viewport.
+
+    space_ids: GlobalIds or space Name/LongName ("Sala"); empty -> all spaces.
+    color_by: "position" (floor orange, ceiling blue, wall green, inclined magenta),
+              "internal_external" (INTERNAL green, EXTERNAL orange, NOTDEFINED grey...),
+              or "element_class" (one colour per IFC class).
+    element_ids: draw only boundaries related to these elements.
+    show_labels: label each surface with element name and area.
+    Returns the colour legend. Remove with clear_temporary_drawings (group "boundaries <space>").
+    """
+    return _send("draw_space_boundaries", dict(space_ids=space_ids, color_by=color_by, fill=fill,
+                                               opacity=opacity, show_labels=show_labels,
+                                               element_ids=element_ids, rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def suggest_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    search_depth: float = 0.30,
+    proximity: float = 0.03,
+    min_area: float = 0.02,
+    include_coverings: bool = True,
+    max_thickness: float = 1.0,
+    candidate_classes: Optional[List[str]] = None,
+    draw: bool = True,
+    show_labels: bool = False,
+    opacity: float = 0.35,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    PREVIEW (does not modify the model) of 2nd-level space boundaries computed from geometry,
+    compared with the boundaries that already exist.
+
+    Method: each planar face of the IfcSpace solid is intersected (shapely) with the faces of the
+    building elements that face it within `search_depth` m; the nearest element claims each
+    part of the face (what the space "sees"). With include_coverings=True, regions claimed by a
+    covering also get a boundary for the construction element behind it (wall/slab).
+    Doors/windows become 2b boundaries with ParentBoundary on their host wall boundary.
+    INTERNAL / EXTERNAL / EXTERNAL_EARTH come from a ray cast outwards (other space found
+    within max_thickness -> INTERNAL, unless one of them is EXTERNAL; terrain -> EXTERNAL_EARTH).
+    CorrespondingBoundary pairs are matched between the selected spaces.
+
+    Returns, per space: proposed boundaries (element, position, area, depth, internal/external,
+    other space, 2a/2b, status new|exists), regions not covered by any element (virtual-boundary
+    candidates) and existing boundaries that the geometry does not reproduce.
+    draw=True draws the proposal: green new, blue already existing, magenta outline behind a
+    covering, cyan door/window, yellow uncovered. Clear with clear_temporary_drawings.
+    """
+    return _send("suggest_space_boundaries", dict(space_ids=space_ids, search_depth=search_depth,
+                                                  proximity=proximity, min_area=min_area,
+                                                  include_coverings=include_coverings,
+                                                  max_thickness=max_thickness,
+                                                  candidate_classes=candidate_classes, draw=draw,
+                                                  show_labels=show_labels, opacity=opacity,
+                                                  rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def create_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    mode: str = "add_missing",
+    search_depth: float = 0.30,
+    proximity: float = 0.03,
+    min_area: float = 0.02,
+    include_coverings: bool = True,
+    max_thickness: float = 1.0,
+    candidate_classes: Optional[List[str]] = None,
+    create_virtual: bool = False,
+    dry_run: bool = False,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    WRITE 2nd-level space boundaries computed from geometry (same algorithm as
+    suggest_space_boundaries) into the IFC open in Bonsai.
+
+    mode:
+      - "add_missing": keep existing boundaries, create only the proposed ones not already present.
+      - "replace": delete ALL existing boundaries of the selected spaces and recreate them.
+    Creates IfcRelSpaceBoundary2ndLevel (IfcRelSpaceBoundary on IFC2X3) with
+    IfcConnectionSurfaceGeometry / IfcCurveBoundedPlane in the space placement, PHYSICAL,
+    Internal/External from geometry, Name "2a"/"2b", ParentBoundary for doors/windows and
+    CorrespondingBoundary between adjacent spaces. Description starts with "MCP-generated".
+    create_virtual=True also creates IfcVirtualElement + VIRTUAL boundaries for uncovered faces.
+    dry_run=True only reports what would be done.
+
+    Changes stay in memory until the IFC is saved in Bonsai. Undo with
+    remove_space_boundaries(only_generated=True). Run suggest_space_boundaries first.
+    """
+    return _send("create_space_boundaries", dict(space_ids=space_ids, mode=mode,
+                                                 search_depth=search_depth, proximity=proximity,
+                                                 min_area=min_area, include_coverings=include_coverings,
+                                                 max_thickness=max_thickness,
+                                                 candidate_classes=candidate_classes,
+                                                 create_virtual=create_virtual, dry_run=dry_run,
+                                                 rebuild_cache=rebuild_cache))
+
+
+@mcp.tool()
+def remove_space_boundaries(
+    space_ids: Optional[List[str]] = None,
+    boundary_ids: Optional[List[str]] = None,
+    only_generated: bool = True,
+    dry_run: bool = False,
+) -> str:
+    """
+    Remove space boundaries. By default only those created by create_space_boundaries
+    (Description starting with "MCP-generated") and their virtual elements.
+    Filter by space (GlobalId / Name / LongName) or by boundary STEP ids / GlobalIds.
+    only_generated=False removes any boundary in the selection. dry_run=True only counts.
+    """
+    return _send("remove_space_boundaries", dict(space_ids=space_ids, boundary_ids=boundary_ids,
+                                                 only_generated=only_generated, dry_run=dry_run))
+
+
+@mcp.tool()
+def fix_space_boundary_attributes(
+    space_ids: Optional[List[str]] = None,
+    overwrite: bool = False,
+    remove_duplicates: bool = True,
+    upgrade_to_second_level: bool = False,
+    link_openings: bool = True,
+    link_corresponding: bool = True,
+    max_thickness: float = 1.0,
+    dry_run: bool = True,
+    rebuild_cache: bool = False,
+) -> str:
+    """
+    Repair attributes of EXISTING space boundaries using geometry. dry_run=True (default)
+    only lists the proposed changes with the reason for each one.
+
+    - PhysicalOrVirtualBoundary NOTDEFINED -> PHYSICAL / VIRTUAL from the related element.
+    - InternalOrExternalBoundary NOTDEFINED -> INTERNAL / EXTERNAL / EXTERNAL_EARTH from a ray
+      cast outwards from the boundary (overwrite=True recomputes all values).
+    - remove_duplicates: deletes boundaries repeating the same element and surface.
+    - upgrade_to_second_level: converts plain IfcRelSpaceBoundary to
+      IfcRelSpaceBoundary2ndLevel (same GlobalId and geometry), required for the links below.
+    - link_openings: ParentBoundary of door/window boundaries -> host wall boundary.
+    - link_corresponding: CorrespondingBoundary between the two sides of the same element.
+    Changes stay in memory until the IFC is saved in Bonsai.
+    """
+    return _send("fix_space_boundary_attributes", dict(space_ids=space_ids, overwrite=overwrite,
+                                                       remove_duplicates=remove_duplicates,
+                                                       upgrade_to_second_level=upgrade_to_second_level,
+                                                       link_openings=link_openings,
+                                                       link_corresponding=link_corresponding,
+                                                       max_thickness=max_thickness, dry_run=dry_run,
+                                                       rebuild_cache=rebuild_cache))
 
 
 # -------------------------------
